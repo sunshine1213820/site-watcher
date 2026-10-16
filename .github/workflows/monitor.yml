@@ -1,0 +1,175 @@
+name: Website Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每5分钟检查一次，故意避开整点（GitHub可能延迟或跳过）
+    - cron: '3-59/5 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: site-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装依赖
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: 检查更新并推送
+        env:
+          WXPUSHER_SPT: ${{ secrets.WXPUSHER_SPT }}
+        run: |
+          python - <<'PY'
+          import html
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, urldefrag
+
+          import requests
+          from bs4 import BeautifulSoup
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          # 只抓取这一个栏目，不访问教务、科研等通知列表。
+          PAGE_URL = 'https://gxy.bjfu.edu.cn/xuegongtiandi/tzgg_xg/'
+          STATE_FILE = Path('state.json')
+          DATE_RE = re.compile(r'20\d{2}\s*[-/\.年]\s*\d{1,2}\s*[-/\.月]\s*\d{1,2}|\b\d{1,2}[-/\.]\d{1,2}\b|\d{1,2}月\d{1,2}日')
+
+          def session():
+              s = requests.Session()
+              retries = Retry(total=2, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+              s.mount('https://', HTTPAdapter(max_retries=retries))
+              s.mount('http://', HTTPAdapter(max_retries=retries))
+              s.headers.update({'User-Agent': 'Mozilla/5.0 (compatible; NoticeWatcher/1.0)'})
+              return s
+
+          def fetch_notices(s):
+              response = s.get(PAGE_URL, timeout=20)
+              response.raise_for_status()
+              if not response.encoding or response.encoding.lower() in ('iso-8859-1', 'latin-1'):
+                  response.encoding = response.apparent_encoding
+              soup = BeautifulSoup(response.text, 'html.parser')
+              for element in soup.select('script, style, header, footer, nav'):
+                  element.decompose()
+
+              notices = {}
+              for link in soup.select('a[href]'):
+                  title = ' '.join(link.get_text(' ', strip=True).split())
+                  if not 7 <= len(title) <= 180:
+                      continue
+                  href = link.get('href', '').strip()
+                  if not href or href.startswith(('javascript:', '#', 'mailto:')):
+                      continue
+                  url = urldefrag(urljoin(PAGE_URL, href))[0]
+                  parsed = urlparse(url)
+                  if parsed.hostname != 'gxy.bjfu.edu.cn':
+                      continue
+                  path = parsed.path.lower()
+                  if url.rstrip('/') == PAGE_URL.rstrip('/'):
+                      continue
+                  if re.search(r'/(?:index|list)(?:_\d+)?\.(?:s?html?)$', path):
+                      continue
+
+                  # 通常通知链接在 li/tr 内，日期也在同一条记录中。
+                  row = link.find_parent(['li', 'tr'])
+                  if row is None:
+                      row = link.parent
+                  nearby = ' '.join(row.get_text(' ', strip=True).split())[:280]
+                  has_date = bool(DATE_RE.search(nearby))
+                  in_section = '/xuegongtiandi/tzgg_xg/' in path
+                  looks_like_article = bool(re.search(r'\.(?:s?html?|pdf)$', path))
+                  if not (has_date or (in_section and looks_like_article)):
+                      continue
+                  # 仅把栏目页面上的通知条目当作候选，不爬取其它栏目。
+                  notices[url] = title
+
+              if not notices:
+                  raise RuntimeError('没有识别到学工通知。请检查网页是否可从 GitHub 访问，或页面结构是否变化。')
+              print(f'成功识别 {len(notices)} 条学工通知：')
+              for title in list(notices.values())[:5]:
+                  print(' -', title)
+              return notices
+
+          def push(token, title, content, link=PAGE_URL):
+              # WxPusher 极简推送：凭证只从 GitHub Secrets 获取。
+              response = requests.post('https://wxpusher.zjiecode.com/api/send/message/simple-push', json={
+                  'spt': token,
+                  'summary': title[:100],
+                  'content': content,
+                  'contentType': 2,
+                  'url': link,
+              }, timeout=20)
+              response.raise_for_status()
+              result = response.json()
+              if result.get('code') != 1000 or result.get('success') is False:
+                  raise RuntimeError(f'WxPusher 推送失败：{result.get("msg", "未知原因")} (code={result.get("code")})')
+              print('推送请求已被 WxPusher 接收。')
+
+              token = os.environ.get('WXPUSHER_SPT', '').strip()
+          if not token:
+              raise RuntimeError('请先在仓库 Settings → Secrets and variables → Actions 创建 WXPUSHER_SPT，并填入以 SPT_ 开头的凭证。')
+          current = fetch_notices(session())
+          now = datetime.now(timezone.utc)
+
+          if not STATE_FILE.exists():
+              # 第一次运行：记录当前公告，不把历史公告当作新公告。
+              push(token, '网站监控已启动',
+                   f'<p>监控已启动，首次识别 {len(current)} 条已有通知。</p>'
+                   '<p>此后发现新通知才会提醒。</p>'
+                   f'<p><a href="{html.escape(PAGE_URL, quote=True)}">打开学工通知栏目</a></p>')
+              state = {'seen': current, 'last_heartbeat': now.isoformat()}
+              STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+              print('已建立初始记录。')
+          else:
+              state = json.loads(STATE_FILE.read_text(encoding='utf-8'))
+              seen = state.get('seen', {})
+              if not isinstance(seen, dict):
+                  raise RuntimeError('state.json 格式不正确。')
+              added = [(url, title) for url, title in current.items() if url not in seen]
+              if len(added) > 20:
+                  raise RuntimeError(f'一次出现 {len(added)} 条新链接，可能是网页改版；为防止误推送已暂停。')
+              if added:
+                  items = ''.join(
+                      f'<li><a href="{html.escape(url, quote=True)}">{html.escape(title)}</a></li>'
+                      for url, title in added
+                  )
+                  push(token, f'新通知：{len(added)} 条',
+                       f'<p>发现新通知：</p><ol>{items}</ol>',
+                       added[0][0] if len(added) == 1 else PAGE_URL)
+                  seen.update(current)
+                  state['seen'] = seen
+                  state['last_heartbeat'] = now.isoformat()
+                  STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                  print(f'发现并推送 {len(added)} 条新通知。')
+              else:
+                  print('本次没有新通知。')
+                  # 每30天更新一次仓库活动记录，降低定时任务因长期不活跃而停用的风险。
+                  stamp = datetime.fromisoformat(state.get('last_heartbeat', '2000-01-01T00:00:00+00:00'))
+                  if (now - stamp).days >= 30:
+                      state['last_heartbeat'] = now.isoformat()
+                      STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                      print('已更新30天活动记录。')
+          PY
+      - name: 保存已推送记录
+        run: |
+          if [ -n "$(git status --porcelain -- state.json)" ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add state.json
+            git commit -m 'Update watcher state'
+            git push
+          else
+            echo '状态未变化，不需要提交。'
+          fi
