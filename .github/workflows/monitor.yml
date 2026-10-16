@@ -117,7 +117,7 @@ jobs:
                   raise RuntimeError(f'WxPusher 推送失败：{result.get("msg", "未知原因")} (code={result.get("code")})')
               print('推送请求已被 WxPusher 接收。')
 
-              token = os.environ.get('WXPUSHER_SPT', '').strip()
+          token = os.environ.get('WXPUSHER_SPT', '').strip()
           if not token:
               raise RuntimeError('请先在仓库 Settings → Secrets and variables → Actions 创建 WXPUSHER_SPT，并填入以 SPT_ 开头的凭证。')
           current = fetch_notices(session())
